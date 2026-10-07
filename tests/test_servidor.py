@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -182,6 +183,59 @@ class TestRunCommand(unittest.TestCase):
         r = servidor.run_command("head -c 600000 /dev/zero | base64", 20)
         self.assertTrue(r["truncated"])
         self.assertLess(len(r["stdout"]), servidor.MAX_OUTPUT + 200)
+
+
+class TestTunel(unittest.TestCase):
+    """Funciones puras del modo --tunnel: sin red, sin cloudflared real."""
+
+    def test_extract_url_linea_banner_real(self):
+        linea = ("2026-10-07T19:18:38Z INF |  "
+                 "https://already-gloves-balloon-brothers.trycloudflare.com")
+        self.assertEqual(
+            servidor.extract_tunnel_url(linea),
+            "https://already-gloves-balloon-brothers.trycloudflare.com")
+
+    def test_extract_url_en_texto_y_sin_barra_final(self):
+        got = servidor.extract_tunnel_url(
+            "Visitá https://postposted-fixes-mall-burns.trycloudflare.com/ hoy")
+        self.assertEqual(got,
+                         "https://postposted-fixes-mall-burns.trycloudflare.com")
+
+    def test_extract_url_lineas_sin_trycloudflare(self):
+        for linea in ("", None, "hola mundo",
+                      "https://example.com/pagina",
+                      "INF Registered tunnel connection ip=198.41.200.63"):
+            self.assertIsNone(servidor.extract_tunnel_url(linea))
+
+    def test_find_cloudflared_explicito(self):
+        self.assertEqual(servidor.find_cloudflared(__file__), __file__)
+        self.assertIsNone(servidor.find_cloudflared("/no/existe/cloudflared"))
+
+    def test_find_cloudflared_busca_en_path(self):
+        from unittest import mock
+        with mock.patch.object(servidor.shutil, "which",
+                               return_value="/usr/local/bin/cloudflared"):
+            self.assertEqual(servidor.find_cloudflared(),
+                             "/usr/local/bin/cloudflared")
+
+    def test_tunnel_stop_sin_proceso_no_explode(self):
+        t = servidor.Tunnel("definitivamente-no-existe", 1)
+        t.stop()
+
+    @unittest.skipIf(os.name == "nt", "el fake usa /bin/sh")
+    def test_tunnel_extrae_url_de_hijo_fake(self):
+        tmp = tempfile.mkdtemp(prefix="rts-tun-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        fake = os.path.join(tmp, "fake-cf.sh")
+        with open(fake, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n"
+                    "echo 'xxx INF |  https://fake-a-b-c.trycloudflare.com'\n")
+        os.chmod(fake, 0o755)
+        t = servidor.Tunnel(fake, 9, quiet=True)
+        t.start()
+        self.assertTrue(t.url_event.wait(5))
+        self.assertEqual(t.url, "https://fake-a-b-c.trycloudflare.com")
+        t.stop()
 
 
 if __name__ == "__main__":

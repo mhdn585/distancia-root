@@ -12,8 +12,10 @@ a través de internet, sin abrir puertos en routers/firewalls.
 - 100% Python. `servidor.py` usa solo la librería estándar (cero dependencias,
   para instalarlo en cualquier PC corporativa).
 - `cliente.py` usa `prompt_toolkit` (única dependencia, solo en la PC del cliente).
-- La conectividad entre redes distintas la resuelve **cloudflared** (quick
-  tunnel), no código nuestro.
+- La conectividad entre redes distintas la provee **cloudflared** (quick o
+  named tunnel), no es código nuestro. Pero `servidor.py --tunnel` puede
+  **lanzarlo y administrarlo como hijo** para no abrir una segunda terminal
+  (ver §6.3).
 
 ## 2. Arquitectura
 
@@ -38,13 +40,15 @@ PC DE CASA (cliente)                 INTERNET                 PC DEL TRABAJO (se
   necesita reglas de firewall). El tráfico del cliente entra por esa conexión ya
   abierta y se reenvía a localhost.
 - El túnel quick es efímero: cada ejecución de cloudflared devuelve una URL
-  nueva `https://xxxx.trycloudflare.com` que hay que pasarle al cliente.
+  nueva `https://xxxx.trycloudflare.com` que hay que pasarle al cliente. Con
+  `servidor.py --tunnel` el propio servidor captura esa URL de la salida de su
+  hijo cloudflared y la imprime lista para copiar (ver §6.3).
 
 ## 3. Archivos del repo
 
 | Archivo | Rol |
 |---|---|
-| `servidor.py` | HTTP server + ejecutor PowerShell + API de archivos. Corre en Windows. |
+| `servidor.py` | HTTP server + ejecutor PowerShell + API de archivos + tunel integrado opcional (`--tunnel`). Corre en Windows (también Linux para pruebas). |
 | `cliente.py` | TUI prompt_toolkit: REPL + explorador de archivos + editor. Corre en cualquier SO. |
 | `requirements.txt` | Deps del cliente únicamente (`prompt_toolkit`). |
 | `tests/test_servidor.py` | Unit tests de servidor.py (sin sockets). |
@@ -128,8 +132,10 @@ Adaptado a terminal 168×63 (pero se degrada sin romperse a otros tamaños).
   real → `$EDITOR` (Windows: `notepad /wait` vía `start`) → si cambió,
   `/fs/write` de vuelta.
 - `do_get`/`put`: subida/bajada cruda (bytes, sin base64).
+- Si hay token (`--token` o env `REMOTEPS_TOKEN`), manda `Authorization: Bearer`
+  en TODOS los requests (`Remote._req`, cliente.py). Sin token: no manda header.
 - Comandos: `/salir /ping /cd /ls /cat /edit /get /put /rm /mkdir /url /timeout
-  /clear /help` + también `salir` sin barra.
+  /clear /help` + también `salir` / `exit` / `quit` sin barra.
 
 ## 6. Cómo ejecutar
 
@@ -177,7 +183,15 @@ El cliente manda `Authorization: Bearer <token>` en TODOS los requests
 
 ### 6.2 Exprés — quick tunnel (sin cuenta ni dominio, URL cambia cada vez)
 
-**PC del trabajo:**
+**PC del trabajo — UNA sola terminal (recomendado, requiere cloudflared en PATH):**
+```bat
+python servidor.py --tunnel
+:: para auth: set REMOTEPS_TOKEN=... antes de lanzar (no hay flag --token en servidor)
+:: cuando cloudflared la crea, imprime la URL https://xxxx.trycloudflare.com
+:: y el comando exacto para el cliente (Ctrl+C apaga servidor + tunel juntos)
+```
+
+**PC del trabajo — variante manual (dos terminales, o cloudflared sin PATH):**
 ```bat
 set REMOTEPS_TOKEN=            (opcional: definir para exigir Bearer token)
 python servidor.py             (como Administrador si hace falta elevar)
@@ -202,6 +216,52 @@ Limitación del modo fijo: hay que encender la PC del trabajo físicamente (el
 servicio arranca con Windows). "Despertarla" desde casa queda como mejora
 futura: Wake-on-LAN con un segundo dispositivo en la LAN.
 
+### 6.3 Túnel integrado: `servidor.py --tunnel` (detalle)
+
+Una sola terminal en la PC objetivo: el propio `servidor.py` lanza y administra
+cloudflared como **proceso hijo**. Implementación (en servidor.py):
+
+- `find_cloudflared(explicit=None)` — busca el binario: `shutil.which` en PATH
+  y, en Windows, carpetas típicas (`C:\Program Files\cloudflared`,
+  `%USERPROFILE%\.cloudflared`, `%LOCALAPPDATA%\Programs`). Con `--cloudflared
+  <ruta>` se fuerza una ruta explícita. Si no lo encuentra con `--tunnel` puesto
+  → mensaje claro con el link de descarga y `exit(1)` (no levanta el HTTP server).
+- `TUNNEL_URL_RE` + `extract_tunnel_url(line)` — regex pura
+  `https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com` que funciona sobre las líneas
+  reales del log de cloudflared (con prefijos `... INF |  `). Pureza = testeable
+  sin red (clase `TestTunel` en tests/test_servidor.py).
+- `class Tunnel(binary, port, quiet=False)`:
+  - Hijo: `[cloudflared, "tunnel", "--url", f"http://127.0.0.1:{port}",
+    "--no-autoupdate"]` con stdout+stderr combinados por PIPE. En POSIX usa
+    `start_new_session=True` (así SIGINT/SIGTERM del terminal NO matan al hijo
+    antes de tiempo; nosotros lo terminateamos a propósito) y en Windows
+    `CREATE_NO_WINDOW` (no se abre consola extra).
+  - Un **thread daemon** lee línea a línea; la primera URL distinta → la guarda,
+    setea `url_event` e imprime: `[tunel] URL publica: ...` + el comando exacto
+    para el cliente.
+  - Si cloudflared muere: **backoff de reinicio** `(2,5,10,20,30)s` hasta
+    `MAX_RESTARTS=5`; si renace con URL nueva, se imprime igual. Más de 5 caídas
+    → avisa y se rinde (el HTTP server sigue vivo localmente).
+  - `stop()` = SIGTERM al hijo (SIGKILL a los 5 s) + flag `stopping` para cortar
+    el ciclo de reinicio.
+- Apagado coordinado: `main()` traduce **Ctrl+C (SIGINT) y SIGTERM/SIGBREAK a un
+  mismo camino** (`_termina` lanza `KeyboardInterrupt`) y en el `finally` hace
+  `httpd.shutdown()` + `tunnel.stop()`. Una vez apagado, **la URL deja de
+  responder** (el 1033 de Cloudflare) porque el hijo murió con el padre. Nunca
+  queda cloudflared huérfano por Ctrl+C o `kill <pid>`; solo con SIGKILL
+  (imposible de capturar) — en ese caso limpiar con `pkill -x cloudflared`.
+- `--print-url` — mismo modo pero **stdout emite SOLO la URL cruda** (todo lo
+  demás va a stderr); pensado para scripts:
+  `URL=$(python servidor.py --print-url &)` + `wait`/lectura por línea.
+- Sin flags, el comportamiento es idéntico al histórico (cloudflared afuera).
+- Caveats:
+  - La URL aparece ANTES de que el edge de Cloudflare propague; el primer
+    request puede dar 1033 unos segundos (verificado real: ~10–30 s).
+  - En redes que bloquean QUIC (UDP), cloudflared degrada solo a HTTP/2 — el
+    `--tunnel` no necesita hacer nada extra, pero ver el precheck en el log.
+  - No usa `config.yml` ni credenciales: es siempre **quick tunnel** (URL nueva
+    por corrida). Para URL fija seguir con §6.1 y NO usar `--tunnel`.
+
 ## 7. Decisiones de diseño (y por qué)
 
 | Decisión | Justificación |
@@ -214,16 +274,22 @@ futura: Wake-on-LAN con un segundo dispositivo en la LAN.
 | Envío binario crudo en upload/download | 33% más chico que base64 y el servidor puede streaming a temp file. |
 | Timeout cliente 90s default | Quick tunnels cierran conexiones idle a los ~100 s. `/timeout` permite 1–300 (el servidor clampa a 300). |
 | `/bin/sh` como shell de tests (var `REMOTEPS_SHELL`) | Permite testear toda la lógica HTTP/cwd/truncado/timeout en Linux sin Windows. |
+| Túnel opt-in (`--tunnel`), nunca por defecto | No rompe modo servicio/named-tunnel ni PCs corporativas sin cloudflared; un flag explícito evita levantar exponer la máquina sin querer. |
+| Capturar la URL parseando la salida del hijo (no API de Cloudflare) | Quick tunnels no tienen API sin cuenta; el log de cloudflared es la única fuente. Regex pura y testeable offline. |
 
 ## 8. Tests
 
 ```bash
-.venv/bin/python -m unittest discover tests -v        # 54 tests, ~3 s
+.venv/bin/python -m unittest discover tests -v        # 63 tests, ~3 s
+# un solo test:
+.venv/bin/python -m unittest tests.test_servidor.TestTunel.test_extract_url_linea_banner_real
+# lint rápido (pyflakes está en el venv pero NO en requirements.txt):
+.venv/bin/pyflakes servidor.py cliente.py tests/*.py
 ```
 
 | Suite | Qué cubre |
 |---|---|
-| `test_servidor.py` | `build_command` (posix + rama PowerShell con `-EncodedCommand`/UTF-16LE/base64), `parse_meta` (centinela, rutas con `\|`, ausencia), `_cap` (truncado preserva el final), `expand_path` (relativo/abs/root/null-byte), fs_* directas (roundtrip, orden dirs, mkdir recursivo, bloqueo raíz), `run_command` real vía `/bin/sh` (echo, stderr+rc≠0, comando inexistente, **persistencia de cd**, **timeout mata en <6s**, salida 600 KB truncada). |
+| `test_servidor.py` | `build_command` (posix + rama PowerShell con `-EncodedCommand`/UTF-16LE/base64), `parse_meta` (centinela, rutas con `\|`, ausencia), `_cap` (truncado preserva el final), `expand_path` (relativo/abs/root/null-byte), fs_* directas (roundtrip, orden dirs, mkdir recursivo, bloqueo raíz), `run_command` real vía `/bin/sh` (echo, stderr+rc≠0, comando inexistente, **persistencia de cd**, **timeout mata en <6s**, salida 600 KB truncada), `TestTunel` (`extract_tunnel_url` sobre líneas reales del banner de cloudflared, `find_cloudflared` explícito/PATH mock, `Tunnel.stop()` sin hijo, e hilo `Tunnel` completo contra un fake `/bin/sh` que imprime la URL). |
 | `test_cliente.py` | `parse_input` (remoto vs `/local` vs `salir`), `join_url`, `human_size`, `shorten`, `remote_pjoin`, `local_basename`, `format_result` (rc/stderr/truncado), transporte `Remote._req` con `urlopen` mockeado: JSON/bytes/URLError→"sin conexion"/HTTPError con JSON de error/`X-Remote-Path` en upload, tokens del toolbar. |
 | `test_integration.py` | Servidor HTTP real en puerto efímero con `/bin/sh`: 11 tests E2E — ping, execute ok/comillas raras/error, cd persistente, timeout, truncado, ciclo completo fs (mkdir→write→read→list→upload→download byte-exact→delete), 404/400, token 401+200, bloqueo delete raíz. |
 
@@ -235,7 +301,7 @@ Limitaciones conocidas de los tests:
 ### Smoke test de TUI bajo pseudo-terminal
 
 ```bash
-REMOTEPS_SHELL=/bin/sh REMOTEPS_PORT=18080 python servidor.py &   # servidor fake
+REMOTEPS_SHELL=/bin/sh REMOTEPS_PORT=18080 python servidor.py &   # servidor fake (sin tunel)
 python cliente.py --url http://127.0.0.1:18080                    # usar /ls, /ping, etc.
 ```
 Nota descubierta: `bottom_toolbar` de prompt_toolkit solo se pinta si el
@@ -248,10 +314,11 @@ desaparecer el toolbar tras ~2 s — es limitación del harness, no del código.
   vea (historial, share, logs) puede ejecutar **cualquier cosa** en la PC del
   trabajo, con los privilegios del proceso servidor (Admin = control total).
 - Mitigaciones recomendadas:
-  1. Setear `REMOTEPS_TOKEN` en ambas PCs (activa Bearer en servidor; el
-     cliente aún no lo envía → agregar en `Remote._req` headers).
+  1. Setear `REMOTEPS_TOKEN` igual en ambas PCs (activa Bearer en el servidor;
+     el cliente ya lo envía solo si tiene la env o `--token`).
   2. Cloudflare Access (Zero Trust) delante del hostname → auth real gratis.
   3. No compartir la URL; considerarla secreta y rotar (reiniciar cloudflared).
+     Con `--tunnel`, reiniciar = Ctrl+C y volver a lanzar (URL nueva).
 - Riesgos heredados del concepto: el servidor ejecuta sin allowlist ni
   confirmación. Un `Remove-Item C:\ -Recurse` viaja igual que un `Get-Process`.
 - El truncado de salida (512 KB) y los timeouts evitan DoS accidental al cliente.
@@ -260,13 +327,13 @@ desaparecer el toolbar tras ~2 s — es limitación del harness, no del código.
 ## 10. Configuración (variables de entorno)
 
 Servidor: `REMOTEPS_PORT` (8080), `REMOTEPS_TOKEN` (""), `REMOTEPS_SHELL`
-(powershell.exe / /bin/sh en tests).
-Cliente: `REMOTEPS_URL` (URL del túnel), `EDITOR` (para /edit).
+(powershell.exe / /bin/sh en tests). Flags: `--tunnel`, `--cloudflared <ruta>`,
+`--print-url` (ver §6.3).
+Cliente: `REMOTEPS_URL` (URL del túnel), `REMOTEPS_TOKEN` (Bearer, o `--token`),
+`EDITOR` (para /edit).
 
 ## 11. Mejoras futuras (no implementadas)
 
-- Named tunnel con hostname fijo (cuenta Cloudflare + dominio) → URL permanente.
-- Token Bearer también en el cliente (env `REMOTEPS_TOKEN` + header) + doc.
 - Sesión PowerShell residente stateful (variables/jobs persisten).
 - Streaming de salida larga (chunked) en vez de esperar el fin del comando.
 - Historial de comandos por-PC, sincronizar cwd con `!` del prompt de PS.

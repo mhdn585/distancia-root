@@ -9,15 +9,23 @@ Configuracion por variables de entorno:
   REMOTEPS_PORT    puerto local (default 8080)
   REMOTEPS_TOKEN   token Bearer requerido en cada request (vacio = sin auth)
   REMOTEPS_SHELL   shell a usar (default powershell.exe; /bin/sh se usa en tests)
+
+Modo terminal unico:
+  python servidor.py --tunnel
+  Lanza cloudflared como proceso hijo, extrae la URL publica de su salida y la
+  imprime en esta misma terminal. Ctrl+C apaga servidor + tunel a la vez.
 """
 from __future__ import annotations
 
+import argparse
 import base64
 import getpass
 import json
 import os
 import platform
+import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -38,6 +46,7 @@ MAX_UPLOAD = 200 * 1024 * 1024
 DEFAULT_TIMEOUT = 60
 MAX_TIMEOUT = 300
 SENTINEL = "__REMOTEPS_META__"
+TUNNEL_URL_RE = re.compile(r"https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com")
 
 SHELL = os.environ.get("REMOTEPS_SHELL") or (
     "powershell.exe" if os.name == "nt" else "/bin/sh"
@@ -289,6 +298,132 @@ def ps_version() -> str:
     return _psver
 
 
+# ---------------------------------------------------------------- tunel integrado
+
+
+def extract_tunnel_url(line):
+    """Busca la URL del quick tunnel dentro una linea de salida de cloudflared.
+    Funciona con el formato real ('... INF |  https://xxx.trycloudflare.com').
+    Devuelve la URL sin barra final, o None si la linea no tiene ninguna."""
+    m = TUNNEL_URL_RE.search(line or "")
+    return m.group(0) if m else None
+
+
+def find_cloudflared(explicit=None):
+    """Localiza el binario cloudflared. Con `explicit` valida esa ruta.
+    Sin ella: PATH primero y en Windows las carpetas tipicas de instalacion."""
+    if explicit:
+        return explicit if os.path.isfile(explicit) else None
+    cf = shutil.which("cloudflared")
+    if cf:
+        return cf
+    if os.name == "nt":
+        bases = (
+            os.environ.get("SystemDrive", "C:") + r"\Program Files\cloudflared",
+            os.path.join(os.environ.get("USERPROFILE", ""), ".cloudflared"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs"),
+        )
+        for base in bases:
+            for name in ("cloudflared.exe", "cloudflared"):
+                cand = os.path.join(base, name) if base else ""
+                if cand and os.path.isfile(cand):
+                    return cand
+    return None
+
+
+class Tunnel:
+    """cloudflared como proceso hijo dentro de servidor.py.
+
+    - Lanza `cloudflared tunnel --url http://127.0.0.1:<port> --no-autoupdate`.
+    - Un thread lee stdout+stderr combinado linea a linea; cuando
+      extract_tunnel_url encuentra la URL, la imprime y marca url_event.
+    - Si cloudflared muere (red, edge, etc.) reinicia con backoff hasta
+      MAX_RESTARTS intentos; si sale una URL nueva se imprime igual.
+    - stop() manda SIGTERM (kill forzado a los 5s) y corta el ciclo de
+      reinicio. main() lo llama al Ctrl+C: una sola terminal apaga
+      servidor y tunel juntos.
+    """
+
+    MAX_RESTARTS = 5
+    BACKOFF = (2, 5, 10, 20, 30)
+
+    def __init__(self, binary, port, quiet=False):
+        self.binary = binary
+        self.port = port
+        self.quiet = quiet
+        self.proc = None
+        self.url = None
+        self.url_event = threading.Event()
+        self.stopping = False
+        self._thread = None
+        self._restarts = 0
+
+    def start(self):
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _say(self, msg):
+        """Diagnostica del tunel: stdout si es modo humano, stderr si --print-url
+        (asi un script solo ve la URL cruda en stdout)."""
+        print(msg, file=sys.stderr if self.quiet else sys.stdout, flush=True)
+
+    def _spawn(self):
+        argv = [self.binary, "tunnel", "--url",
+                f"http://127.0.0.1:{self.port}", "--no-autoupdate"]
+        kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT,
+                  "text": True, "encoding": "utf-8", "errors": "replace",
+                  "bufsize": 1}
+        if os.name == "nt":
+            kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+        else:
+            kwargs["start_new_session"] = True
+        try:
+            self.proc = subprocess.Popen(argv, **kwargs)
+        except OSError as e:
+            self._say(f"[tunel] no se pudo lanzar {self.binary}: {e}")
+            self.proc = None
+        return self.proc
+
+    def _loop(self):
+        while not self.stopping:
+            proc = self._spawn()
+            if proc is None:
+                return
+            for raw in iter(proc.stdout.readline, ""):
+                url = extract_tunnel_url(raw)
+                if url and url != self.url:
+                    self.url = url
+                    self.url_event.set()
+                    if self.quiet:
+                        print(url, flush=True)
+                    else:
+                        print(f"\n[tunel] URL publica: {url}", flush=True)
+                        print(f"[tunel] desde la otra PC:  "
+                              f"python cliente.py --url {url}", flush=True)
+            proc.wait()
+            if self.stopping:
+                break
+            self._restarts += 1
+            if self._restarts > self.MAX_RESTARTS:
+                self._say("[tunel] cloudflared murio demasiadas veces; "
+                          "no se reinicia mas")
+                break
+            wait_s = self.BACKOFF[min(self._restarts - 1, len(self.BACKOFF) - 1)]
+            self._say(f"[tunel] cloudflared cayo; reinicio "
+                      f"{self._restarts}/{self.MAX_RESTARTS} en {wait_s}s...")
+            time.sleep(wait_s)
+
+    def stop(self):
+        self.stopping = True
+        proc = self.proc
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "RemotePS/1.0"
@@ -460,24 +595,96 @@ def serve(host: str = HOST, port: int = PORT) -> ThreadingHTTPServer:
 
 
 def main():
-    print("=" * 64)
-    print("  RemotePS — servidor")
-    print(f"  Shell      : {SHELL}" + (" (powershell)" if IS_POWERSHELL else ""))
-    print(f"  Escucha    : http://{HOST}:{PORT}  (solo loopback)")
-    print("  Autenticac : " + (
+    ap = argparse.ArgumentParser(
+        prog="servidor.py",
+        description="RemotePS: servidor local (HTTP en loopback + ejecutor de "
+                    "shell). Sin flags se comporta como siempre: solo escucha "
+                    "en 127.0.0.1 y cloudflared corre aparte.")
+    ap.add_argument("--tunnel", action="store_true",
+                    help="lanza cloudflared como hijo, captura su URL publica "
+                         "y la imprime aqui (una sola terminal)")
+    ap.add_argument("--cloudflared", metavar="RUTA", default=None,
+                    help="ruta explicita al binario cloudflared "
+                         "(por defecto se busca en PATH y carpetas tipicas)")
+    ap.add_argument("--print-url", action="store_true",
+                    help="imprime solo la URL cuando aparece (util para scripts)")
+    args = ap.parse_args()
+
+    use_tunnel = args.tunnel or args.print_url
+    cf_bin = None
+    if use_tunnel:
+        cf_bin = find_cloudflared(args.cloudflared)
+        if not cf_bin:
+            print("[servidor] ERROR: no encuentro cloudflared"
+                  + (f" en {args.cloudflared}" if args.cloudflared
+                     else " en PATH ni carpetas tipicas"),
+                  file=sys.stderr)
+            print("[servidor] bajalo de: https://developers.cloudflare.com/"
+                  "cloudflare-one/connections/connect-networks/downloads/"
+                  "  o pasala ruta con --cloudflared <ruta>", file=sys.stderr)
+            sys.exit(1)
+
+    quiet = args.print_url  # stdout reservado solo para la URL
+    out = sys.stderr if quiet else sys.stdout
+
+    def say(msg):
+        print(msg, file=out, flush=True)
+
+    say("=" * 64)
+    say("  RemotePS — servidor")
+    say(f"  Shell      : {SHELL}" + (" (powershell)" if IS_POWERSHELL else ""))
+    say(f"  Escucha    : http://{HOST}:{PORT}  (solo loopback)")
+    say("  Autenticac : " + (
         "TOKEN activo" if AUTH_TOKEN else "SIN token (la URL del tunel es la credencial)"))
-    print(f"  Inicio     : {sys.argv[0]}")
-    print("  Requiere cloudflared: cloudflared tunnel --url http://localhost:%d" % PORT)
-    print("  Ctrl+C para detener.")
-    print("=" * 64)
+    say(f"  Inicio     : {sys.argv[0]}")
+    if cf_bin:
+        say(f"  Tunel      : automatico con {cf_bin} (hijo de este proceso)")
+    else:
+        say("  Requiere cloudflared: cloudflared tunnel --url http://localhost:%d" % PORT)
+    say("  Ctrl+C para detener.")
     if os.name == "nt":
-        print("[nota] ejecutalo como Administrador si necesitas comandos elevados\n")
-    httpd = serve()
+        say("[nota] ejecutalo como Administrador si necesitas comandos elevados")
+    say("=" * 64)
+
+    try:
+        httpd = serve()
+    except OSError as e:
+        print(f"[servidor] ERROR: no se pudo escuchar en {HOST}:{PORT}: {e}",
+              file=sys.stderr)
+        print("[servidor] ya hay otra instancia corriendo: cerrala"
+              " (Ctrl+C alli o: pkill -f servidor.py)", file=sys.stderr)
+        print(f"[servidor] ...o usá otro puerto: REMOTEPS_PORT={PORT + 1} "
+              f"python {sys.argv[0]}", file=sys.stderr)
+        sys.exit(1)
+
+    tunnel = None
+    if cf_bin:
+        tunnel = Tunnel(cf_bin, PORT, quiet=quiet)
+        tunnel.start()
+        say("[tunel] iniciando cloudflared... la URL puede tardar 10-30s "
+            "y cambia en cada arranque")
+
+    def _termina(signum, frame):
+        raise KeyboardInterrupt
+
+    for _sig in (signal.SIGTERM, getattr(signal, "SIGBREAK", None)):
+        if _sig is not None:
+            try:
+                signal.signal(_sig, _termina)
+            except (ValueError, OSError):
+                pass
+
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n[servidor] apagando...")
+        say("\n[servidor] apagando...")
+    finally:
         httpd.shutdown()
+        httpd.server_close()
+        if tunnel:
+            say("[tunel] deteniendo cloudflared...")
+            tunnel.stop()
+            say("[tunel] listo: la URL publica ya no responde")
 
 
 if __name__ == "__main__":
